@@ -1,0 +1,683 @@
+---
+title: "Tutorial - SOM-based clustering"
+author: "Daniel Schönberger - University of Kentucky"
+date: "2024-12-28"
+output: html_document
+---
+
+## SOM-based species delimitation (Pyron et al. 2022, 2023)
+- Use single-layer (one data matrix) or multi-layer (multiple data matrices) Kohonen Self-Organizing Maps (SOMs or SuperSOMs) to infer clusters and delimit species using unsupervised machine learning
+- SOMs are used to reduce high-dimensional data into two-dimensional grid to which individuals are assigned based on their clustering of similar values across input features
+- Number of clusters are chosen by k-means clustering of grid cells into proximate units based on the weighted sum of squares (WSS) of neighbor distances between adjacent cells
+- Uses kohonen package (Wehrens & Buydens 2007)
+- Contribution of each layer to final model output is recorded along with clustering assignment of each individual over multiple learning replicates
+- Results are similar to STRUCTURE analysis including admixture estimates but represent unified delimitation model that incorporates various dimensions of ecological and evolutionary divergence for integrative taxonomy
+- If only allelic data are used, then assignment probabilities approximate individual ancestry coefficients
+- If multiple layers are used, assignment probabilities represent "species coefficients"
+- Method is flexible and can take almost any data type as matrix or dataframe
+- Each matrix needs same number of rows (representing individuals or populations) with similar rownames but each can have any number of columns (representing variables such as allele 1 or trait 1)
+- Examples of input matrices: allele frequencies (biallelic SNP matrix), morphological trait data, behavioral data, spatial data (latitude, longitude, elevation), climatic data, host or habitat data, physiological data
+- Data is normalized to range between 0 and 1 (if not done so already)  
+
+### Tutorial
+This example code uses simple simulated data for three different datasets (allele data, environmental data and morphological data) to guide you through this SOM-based clustering approach using single-layer SOMs (each dataset alone) or using all three datasets in an integrative multi-layer Super-SOM. In all functions, I included options to change run and plotting parameters, allowing you to change the default function parameters.
+
+
+### Install and load required R packages
+```{r, message = F, warning = F}
+required_packages <- c("adegenet", "maps", "scales", "conStruct", "poppr", "kohonen", "lsr", "combinat", "viridis")
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = T)) install.packages(pkg)
+  library(pkg, character.only = T)} #install missing and load packages
+```
+
+### Simulate three datasets each with 50 individuals: allele data, environmental data and morphological data
+
+
+##### Specify parameters for all datasets
+```{r}
+rm(list = ls()) #clear environment
+setwd("C:/Users/danie/Desktop/PhD research/Hemileuca maia research/Analyses") #set directory
+set.seed(1) #set seed for reproducibility
+n_individuals <- 50 #simulate dataset with n individuals (needs to be consistent across all datasets)
+rownames_datasets <- "Individual" #name rows (needs to be consistent across all datasets)
+```
+
+##### Allele data (Alleles)
+```{r}
+n_Alleles <- 120 #simulate dataset with 120 alleles
+allele_frequencies <- c('1' = 0.4, '0.5' = 0.25, '0' = 0.35) #set allele frequencies
+Alleles <- data.frame(lapply(1:n_Alleles, function(x) sample(names(allele_frequencies), n_individuals, replace = T, prob = allele_frequencies)),
+                      row.names = paste0(rownames_datasets, 1:n_individuals)) #generate Alleles based on these frequencies
+Alleles[] <- lapply(Alleles, function(x) as.numeric(as.character(x))) #convert character values to numeric (0, 0.5, 1)
+colnames(Alleles) <- paste("Allele", 1:n_Alleles) #rename columns as "Allele 1", "Allele 2", ..., "Allele n"
+head(Alleles)
+```
+
+##### Environmental data (ENV)
+```{r}
+n_env <- 38 #simulate dataset with 38 environmental variables
+ENV <- matrix(runif(n_individuals * n_env, min = 0, max = 100), nrow = n_individuals, ncol = n_env)
+rownames(ENV) <- paste0(rownames_datasets, 1:n_individuals)
+na_indices_env <- sample(1:(n_individuals * n_env), size = round(n_individuals * n_env * 0.07), replace = F) #introduce some rare NAs for realism
+colnames(ENV) <- paste("BIO", 1:n_env) #rename columns as "BIO 1", "BIO 2", ..., "BIO n"
+ENV[na_indices_env] <- NA
+head(ENV)
+```
+
+##### Morphological data (MORPH)
+```{r}
+n_morph <- 6 #simulate morphological data for 6 traits
+MORPH <- matrix(rnorm(n_individuals * n_morph, mean = 5, sd = 2), nrow = n_individuals, ncol = n_morph) #simulate morphological data
+rownames(MORPH) <- paste0(rownames_datasets, 1:n_individuals) #name rows
+na_indices_morph <- sample(1:(n_individuals * n_morph), size = round(n_morph * n_individuals * 0.1), replace = F) #introduce some rare NAs for realism
+MORPH[na_indices_morph] <- NA
+colnames(MORPH) <- paste("Trait", 1:n_morph) #rename columns as "Trait 1", "Trait 2", ..., "Trait n"
+head(MORPH)
+```
+
+
+### Set functions to run, evaluate and plot SOMs (based on the Github of Alex Pyron: https://github.com/rpyron)
+
+##### Function to run single-layer SOM (one matrix)
+```{r}
+Single.Layer.SOM <- function(input_data_matrix,
+                             save_SOM_results,
+                             N_steps = 100,
+                             N_replicates = 100, 
+                             N_considered_clusters = 5, 
+                             learning_rate_alpha_initial = 0.5,
+                             learning_rate_alpha_final = 0.1,
+                             missing_data_percentage = 0.9,
+                             random_starts_kmeans = 25,
+                             training_neighborhoods = "gaussian",
+                             overwrite = T) {
+  
+  # Check if input_data_matrix is matrix, convert if not
+  if (!is.matrix(input_data_matrix)) {
+    message("Converting input_data_matrix to a matrix.")
+    input_data_matrix <- as.matrix(input_data_matrix)} #convert to matrix if not already
+  
+  # Normalize matrix if not already normalized
+  if (!(min(input_data_matrix, na.rm = T) == 0 && max(input_data_matrix, na.rm = T) == 1)) {
+    input_data_matrix <- (input_data_matrix - min(input_data_matrix, na.rm = T)) / (max(input_data_matrix, na.rm = T) - min(input_data_matrix, na.rm = T))
+    message(paste("Matrix normalized to the range [0, 1]."))}
+  
+  # If overwrite is FALSE and the file already exists, return saved results
+  if (!overwrite && file.exists(save_SOM_results)) {
+    message("SOM results already exist. Loading saved results from file and skip running this SOM model")
+    load(save_SOM_results)
+    return(SOM_results)}
+  
+  # Hold containers for results
+  c_mat <- matrix(NA, nrow = nrow(input_data_matrix), ncol = N_replicates, dimnames = list(row.names(input_data_matrix), NULL)) #initialize c_mat as matrix
+  c_mat <- as.data.frame(c_mat) #hold classifiers for SOM
+  l_mat <- data.frame(row.names = 1:N_steps) #hold learning values
+  w_mat <- data.frame(row.names = 1:N_considered_clusters) #hold dWSS for K
+  
+  # Create SOM output grid
+  SOM_output_grid <- somgrid(xdim = round(sqrt(5 * sqrt(nrow(input_data_matrix)))),
+                             ydim = round(sqrt(5 * sqrt(nrow(input_data_matrix)))),
+                             topo = "hexagonal",
+                             neighbourhood.fct = training_neighborhoods)
+  
+  for (j in 1:N_replicates) {
+    
+    # Train SOM model
+    som_model <- som(input_data_matrix, grid = SOM_output_grid, maxNA.fraction = missing_data_percentage, 
+                     alpha = c(learning_rate_alpha_initial, learning_rate_alpha_final), rlen = N_steps)
+    l_mat[, j] <- som_model$changes
+    mydata <- getCodes(som_model) #pull codebook vectors for WSS
+    
+    # Calculate WSS for clusters
+    wss <- (nrow(mydata) - 1) * sum(apply(mydata, 2, var))
+    for (i in 2:(N_considered_clusters)) {wss[i] <- sum(kmeans(mydata, centers = i, nstart = random_starts_kmeans, iter.max = 1e6)$withinss)}
+    N <- nrow(mydata) #sample size for BIC
+    w_mat[, j] <- N * log(wss / N) + log(N) * (1:(N_considered_clusters)) #store BIC values
+    if (which(w_mat[, j] == min(w_mat[, j])) == 1) {num_clusters <- 1
+    } else {
+      temp <- cutree(hclust(dist(diff(wss)), method = "ward.D"), k = 2)
+      goodgrp <- which.min(tapply(diff(wss), temp, mean))
+      num_clusters <- max(which(temp == goodgrp)) + 1}
+    som_cluster <- cutree(hclust(dist(mydata)), num_clusters) #use hierarchical clustering to cluster codebook vectors
+    cluster_assignment <- som_cluster[som_model$unit.classif] #get cluster assignment for each sample
+    c_mat[, j] <- cluster_assignment #add cluster assignments to classifier matrix
+    print(j)}
+  
+  # Save results
+  call <- match.call()
+  input_data_matrix_name <- as.character(call$input_data_matrix) #extract name of input data matrix using match.call
+  SOM_results <- list(c_mat = c_mat, l_mat = l_mat, w_mat = w_mat, som_model = som_model, 
+                      som_cluster = som_cluster, cluster_assignment = cluster_assignment,
+                      input_data_matrix_name = input_data_matrix_name,
+                      N_steps = N_steps,
+                      N_replicates = N_replicates,
+                      N_considered_clusters = N_considered_clusters,
+                      learning_rate_alpha_initial = learning_rate_alpha_initial,
+                      learning_rate_alpha_final = learning_rate_alpha_final,
+                      missing_data_percentage = missing_data_percentage,
+                      random_starts_kmeans = random_starts_kmeans,
+                      training_neighborhoods = training_neighborhoods)
+  save(SOM_results, file = save_SOM_results)
+  
+  return(SOM_results)}
+
+
+## Function to run multi-layer Super-SOM (multiple data matrices)
+Multi.Layer.SOM <- function(input_data_matrices, 
+                            save_SOM_results,
+                            N_steps = 100,
+                            N_replicates = 100, 
+                            N_considered_clusters = 5, 
+                            learning_rate_alpha_initial = 0.5,
+                            learning_rate_alpha_final = 0.1,
+                            missing_data_percentage = 0.9,
+                            random_starts_kmeans = 25,
+                            training_neighborhoods = "gaussian",
+                            overwrite = T) {
+  
+  # Check if all matrices have same number of rows
+  num_rows <- sapply(input_data_matrices, function(mat) nrow(as.matrix(mat))) #get number of rows for each matrix
+  if (length(unique(num_rows)) > 1) {stop("All input matrices must have the same number of rows. Found different row counts: ", paste(num_rows, collapse = ", "))}
+  
+  input_data_matrices <- lapply(seq_along(input_data_matrices), function(index) {
+    mat <- input_data_matrices[[index]]
+    
+    # Convert to matrix if not already
+    if (!is.matrix(mat)) {
+      mat <- as.matrix(mat)
+      message(paste("Matrix", index, "converted to matrix."))}
+    
+    # Convert to numeric if necessary
+    if (!is.numeric(mat)) {
+      message(paste("Matrix", index, "contains non-numeric values. Attempting to convert to numeric."))
+      mat <- apply(mat, 2, as.numeric)
+      if (any(is.na(mat))) {stop(paste("Matrix", index, "contains elements that cannot be converted to numeric. Please check your data."))}}
+    
+    # Normalize matrix if not already normalized
+    if (!(min(mat, na.rm = T) == 0 && max(mat, na.rm = T) == 1)) {
+      mat <- (mat - min(mat, na.rm = T)) / (max(mat, na.rm = T) - min(mat, na.rm = T))
+      message(paste("Matrix", index, "normalized to the range [0, 1]."))}
+    
+    return(mat)}) #end of lapply
+  
+  # Check if row names are consistent across all matrices
+  if (!all(sapply(1:(length(input_data_matrices) - 1), function(i) 
+    identical(rownames(input_data_matrices[[i]]), rownames(input_data_matrices[[i + 1]]))))) {
+    stop("Row names are not consistent across the matrices. Please provide data with matching row names!")} 
+  
+  # If overwrite is FALSE and the file already exists, return saved results
+  if (!overwrite && file.exists(save_SOM_results)) {
+    message("SOM results already exist. Loading saved results from file and skip running this SOM model")
+    load(save_SOM_results)
+    return(SOM_results)}
+  
+  # Create SOM output grid
+  SOM_output_grid <- somgrid(xdim = round(sqrt(5 * sqrt(length(rownames(input_data_matrices[[1]]))))),
+                             ydim = round(sqrt(5 * sqrt(length(rownames(input_data_matrices[[1]]))))),
+                             topo = "hexagonal",
+                             neighbourhood.fct = training_neighborhoods)
+  
+  # Initialize containers for results
+  c_mat <- matrix(NA, nrow = nrow(input_data_matrices[[1]]), ncol = N_replicates, dimnames = list(row.names(input_data_matrices[[1]]), NULL)) #initialize c_mat as matrix
+  c_mat <- data.frame(row.names = row.names(input_data_matrices[[1]])) #hold classifiers for DNAsom
+  d_mat <- data.frame(matrix(NA, nrow = N_replicates, ncol = length(input_data_matrices))) #distance weights
+  l_mats <- lapply(1:length(input_data_matrices), function(i) data.frame(row.names = 1:N_steps)) #learning values
+  w_mat <- data.frame(row.names = 1:N_considered_clusters) #dWSS for K
+  
+  for (j in 1:N_replicates) { #train SOMs
+    som_model <- supersom(data = input_data_matrices, grid = SOM_output_grid, maxNA.fraction = missing_data_percentage, 
+                          alpha = c(learning_rate_alpha_initial, learning_rate_alpha_final), rlen = N_steps) #create SOM model
+    for (i in seq_along(input_data_matrices)) {l_mats[[i]][, j] <- som_model$changes[, i]} #store learning values for each matrix
+    d_mat[j, ] <- som_model$distance.weights #store distance weights
+    
+    # Calculate within-cluster sum of squares (WSS) for each cluster
+    mydata <- do.call(cbind, lapply(1:length(input_data_matrices), function(i) getCodes(som_model)[[i]]))
+    wss <- numeric(N_considered_clusters)
+    wss[1] <- (nrow(mydata) - 1) * sum(apply(mydata, 2, var))
+    for (i in 2:N_considered_clusters) {wss[i] <- sum(kmeans(mydata, centers = i, nstart = random_starts_kmeans, iter.max = 1e6)$withinss)}
+    
+    # Calculate BIC for each cluster using WSS
+    sample_size_BIC <- dim(mydata)[1]
+    w_mat[, j] <- sample_size_BIC * log(wss / sample_size_BIC) + log(sample_size_BIC) * (1:N_considered_clusters)
+    
+    # Determine optimal number of clusters using hierarchical clustering based on WSS values
+    if (which(w_mat[, j] == min(w_mat[, j])) == 1) {num_clusters <- 1
+    } else {
+      temp <- cutree(hclust(dist(diff(wss)), method = "ward.D"), k = 2)
+      goodgrp <- which.min(tapply(diff(wss), temp, mean))
+      num_clusters <- max(which(temp == goodgrp)) + 1}
+    
+    som_cluster <- cutree(hclust(dist(mydata)), num_clusters) #perform hierarchical clustering to assign clusters
+    cluster_assignment <- som_cluster[som_model$unit.classif]
+    c_mat[, j] <- cluster_assignment #store cluster assignments
+    print(j)}
+  
+  # Save results
+  call <- match.call()
+  input_data_matrices_names <- as.character(call$input_data_matrices)
+  SOM_results <- list(c_mat = c_mat, d_mat = d_mat, l_mats = l_mats, w_mat = w_mat, som_model = som_model,
+                      som_cluster = som_cluster, cluster_assignment = cluster_assignment,
+                      input_data_matrices_names = input_data_matrices_names[-1],
+                      N_steps = N_steps,
+                      N_replicates = N_replicates,
+                      N_considered_clusters = N_considered_clusters,
+                      learning_rate_alpha_initial = learning_rate_alpha_initial,
+                      learning_rate_alpha_final = learning_rate_alpha_final,
+                      missing_data_percentage = missing_data_percentage,
+                      random_starts_kmeans = random_starts_kmeans,
+                      training_neighborhoods = training_neighborhoods)
+  save(SOM_results, file = save_SOM_results)
+  
+  return(SOM_results)}
+
+
+## Function to plot learning progress for each SOM matrix
+plot.Learning.SOM <- function(SOM_output, 
+                              color_palette = viridis::turbo, 
+                              alpha_lines = 0.3, 
+                              save_svg = F, 
+                              svg_filename, 
+                              svg_width = 7 / 2.54, 
+                              svg_height = 5 / 2.54,
+                              margin_bottom = 6,
+                              margin_left = margin_bottom,
+                              margin_top = 3,
+                              margin_right = 2) {
+  
+  # Check if l_mat or l_mats exists and is either matrix or list
+  if ("l_mat" %in% names(SOM_output)) {SOM_output$l_mats <- list(SOM_output$l_mat) #convert to list for single-layer case
+  } else if ("l_mats" %in% names(SOM_output)) { #multi-layer case
+  } else {stop("Neither l_mat nor l_mats found in SOM_output.")}
+  if (!is.list(SOM_output$l_mats)) {stop("SOM_output$l_mats is not a list.")} #check if l_mats is list
+  
+  # Convert data.frames to matrices if necessary
+  SOM_output$l_mats <- lapply(SOM_output$l_mats, function(x) {
+    if (is.data.frame(x)) {return(as.matrix(x))} #convert data.frame to matrix
+    return(x)})
+  
+  # Ensure all elements in l_mats are matrices
+  if (!all(sapply(SOM_output$l_mats, is.matrix))) {stop("SOM_output$l_mats contains non-matrix elements after conversion.")}
+  
+  # Extract matrix names (check for multi-layer or single-layer)
+  if ("input_data_matrix_name" %in% names(SOM_output)) {matrix_names <- list(SOM_output$input_data_matrix_name) #single-layer case
+  } else if ("input_data_matrices_names" %in% names(SOM_output)) {matrix_names <- SOM_output$input_data_matrices_names #multi-layer case
+  } else {stop("Matrix names not found in provided SOM_output.")}
+  
+  # Validate matrix names
+  if (length(matrix_names) != length(SOM_output$l_mats)) {stop("The number of matrix names does not match the number of matrices.")}
+  
+  # Determine global ylim
+  global_ylim <- range(unlist(lapply(SOM_output$l_mats, function(mat) 
+    range(mat, na.rm = T))), na.rm = T) * c(0.9, 1.1) #expand range slightly
+  
+  # Prepare base plot
+  first_matrix <- SOM_output$l_mats[[1]] #first matrix for xlim
+  par(mfrow = c(1, 1), mar = c(margin_bottom, margin_left, margin_top, margin_right))
+  plot(NULL, xlim = c(1, nrow(first_matrix)), ylim = global_ylim, xlab = "Training steps", 
+       ylab = "Learning rate change", main = "Training progress across layer(s)", axes = T)
+  
+  # Plot each matrix
+  layer_colors <- color_palette(length(SOM_output$l_mats)) #use dynamic colors
+  for (i in seq_along(SOM_output$l_mats)) {mat <- SOM_output$l_mats[[i]]
+  for (j in 1:ncol(mat)) 
+    lines(mat[, j], col = alpha(layer_colors[i], alpha_lines))} #plot lines
+  legend("topright", legend = matrix_names, col = layer_colors, lty = 1, cex = 0.8, title = "Layers") #add legend
+  
+  # Save as SVG if requested
+  if (save_svg) {
+    svg(svg_filename, width = svg_width, height = svg_height) #open SVG device
+    plot(NULL, xlim = c(1, nrow(first_matrix)), ylim = global_ylim, xlab = "Training steps", 
+         ylab = "Learning rate change", main = "Training progress across layer(s)", axes = T) #recreate plot
+    for (i in seq_along(SOM_output$l_mats)) {mat <- SOM_output$l_mats[[i]]
+    for (j in 1:ncol(mat)) 
+      lines(mat[, j], col = alpha(layer_colors[i], alpha_lines))} #add lines
+    legend("topright", legend = matrix_names, col = layer_colors, lty = 1, cex = 0.8, title = "Layers")
+    dev.off()}}
+
+
+## Function to plot layer weights
+plot.Layers.SOM <- function(SOM_output, color_palette = viridis::turbo) {
+  
+  # Check if 'd_mat' exists in SOM_output
+  if (!"d_mat" %in% names(SOM_output)) {
+    message("Single-layer SOM detected. No layers to plot.")
+    return(invisible(NULL))} #skip plotting for single-layer SOM
+  
+  d_mat <- SOM_output$d_mat #extract distance matrix
+  layer_names <- SOM_output$input_data_matrices_names #extract layer names, excluding "list" placeholder
+  
+  # Validate that names match number of layers
+  if (length(layer_names) != ncol(d_mat)) {
+    message("Mismatch detected. Using generic layer names.")
+    layer_names <- paste0("Matrix ", seq_len(ncol(d_mat)))}
+  
+  # Calculate relative layer weights
+  raw_weights <- sqrt(1 / colMeans(d_mat)) #compute weights
+  names(raw_weights) <- layer_names #assign names to weights
+  sorted_weights <- sort(raw_weights, decreasing = T) #sort weights for better visualization
+  
+  # Plot layer weights with proper labels and colors
+  layer.cols <- setNames(color_palette(length(layer_names)), layer_names) #assign colors to matrix names
+  par(mfrow = c(1, 1))
+  barplot(sorted_weights, main = "Layer weights", col = layer.cols[names(sorted_weights)], names.arg = names(sorted_weights), ylab = "Relative weights (sqrt(1/w))")}
+
+
+## Function to evaluate K-values
+plot.K.SOM <- function(SOM_output, color_palette = viridis::magma) {
+  
+  # Prepare data
+  w_mat <- SOM_output$w_mat #extract BIC matrix from SOM output
+  max_clusters <- nrow(w_mat) #determine maximum number of clusters considered
+  k.cols <- color_palette(max_clusters) #generate color palette with enough colors for each cluster
+  
+  #Set up plotting area and adjust margins
+  par(mfrow = c(3, 1), mar = c(0.5, 4, 1, 0.5))
+  
+  # Create boxplot for BIC values
+  boxplot(t(w_mat), outline = F, notch = F, axes = F, ylab = "BIC", ylim = range(unlist(w_mat)), col = k.cols)
+  axis(1, at = 1:max_clusters, labels = NA)
+  axis(2, at = round(range(unlist(w_mat))), las = 3)
+  title("Number of clusters (k)", line = 0)
+  
+  # Create boxplot for delta BIC
+  d_wss <- apply(w_mat, 2, function(x) diff(diff(x)))
+  boxplot(t(d_wss), outline = F, notch = F, axes = F, ylab = "Delta BIC", col = k.cols)
+  abline(h = 0, lty = 2, col = "black")
+  axis(1, at = 1:(max_clusters - 2), labels = NA)
+  axis(2, at = sort(c(0, round(range(unlist(d_wss))))), las = 3)
+  
+  ## Create barplot for sampling frequency of cluster counts
+  par(mar = c(4, 4, 1, 0.5))
+  all_k <- apply(SOM_output$c_mat, 2, max)
+  barplot(table(factor(all_k, levels = 1:max_clusters)) / SOM_output$N_replicates, ylab = "Sampling frequency", ylim = c(0, 1), col = k.cols)}
+
+
+## Function to get and synchronize labels for different K values and summarize across K for Qmat
+match.k.and.labels.SOM <- function(SOM_output) {
+  
+  # Handle input_data_matrix_1 based on SOM_output$l_mats
+  if (length(SOM_output$som_model$codes) == 1) {input_data_matrix_1 <- get(SOM_output$input_data_matrix_name, envir = .GlobalEnv)
+  } else {input_data_matrix_1 <- get(SOM_output$input_data_matrices_names[1], envir = .GlobalEnv)}
+  
+  # Replace NA values with 0.5 in input_data_matrix_1
+  if (any(is.na(input_data_matrix_1))) {input_data_matrix_1[which(is.na(input_data_matrix_1))] <- 0.5}
+  
+  # Preprocess input data and generate cluster labels
+  input_data_matrix_1_new <- input_data_matrix_1
+  cluster_labels <- rbind.data.frame(lapply(1:SOM_output$N_considered_clusters, function(x) {kmeans(input_data_matrix_1_new, x)$cluster})) #run k-means for each K and store cluster labels
+  rownames(cluster_labels) <- rownames(input_data_matrix_1) #set row names for cluster labels
+  colnames(cluster_labels) <- paste("K", 1:SOM_output$N_considered_clusters, sep = '') #set column names
+  
+  # Extract SOM cluster assignments and filter replicates based on maximum K
+  c_mat <- SOM_output$c_mat #extract cluster assignments matrix from SOM output
+  if (ncol(c_mat) != SOM_output$N_replicates) {stop("The number of columns in SOM_output$c_mat does not match N_replicates. Please check.")}
+  all_k <- apply(c_mat, 2, max) #calculate maximum K for each replicate (column)
+  cc <- c_mat[, which(all_k <= SOM_output$N_considered_clusters)] #filter to keep replicates with K <= N_considered_clusters
+  
+  # Relabel across replicates
+  cca <- cc #create copy of filtered matrix for relabeling
+  for (i in 1:SOM_output$N_replicates) { 
+    run.k <- max(cca[, i]) #get number of clusters (K) for current replicate
+    run.labels <- as.numeric(cluster_labels[, run.k]) #get corresponding labels for current K
+    refactor <- data.frame(row.names = rownames(cluster_labels)) #create dataframe to store relabelings
+    label.perm <- permn(1:run.k) #generate all permutations of labels
+    for (j in 1:length(label.perm)) {refactor[, j] <- cca[, i]} #apply label permutations and calculate best matching relabeling
+    for (k in 1:length(label.perm)) {refactor[, k] <- as.numeric(permuteLevels(factor(refactor[, k]), perm = label.perm[[k]]))} #relabel using permutations
+    cc[, i] <- refactor[, which.min(apply(refactor, 2, function(x) {sum(abs(x - run.labels))}))]} #choose relabeling that minimizes distance to original labels
+  
+  # Calculate Q-matrix (admixture matrix) summarizing cluster memberships and return it
+  q_mat <- t(apply(cc, 1, FUN = function(x) {table(factor(unlist(x), levels = 1:max(all_k)))}) / dim(cca)[2]) #create table for cluster assignments and normalize it by number of replicates
+  SOM_output$q_mat <- q_mat #add q_mat to SOM_output
+  SOM_output$input_data_matrix_1 <- input_data_matrix_1
+  return(SOM_output)}
+
+
+## Function to plot model results as SOM grids (showing sample assignment to cells, cell distances and boundaries between cell clusters)
+plot.Model.SOM <- function(SOM_output,
+                           color_palette_SOM_neighbour_distances = viridis::cividis,
+                           color_palette_SOM_cluster = viridis::viridis, 
+                           boundary_color = "red",
+                           sample_color = "white",
+                           sample_shape = 19,
+                           margin_top = 1.5,
+                           margin_bottom = 1,
+                           margin_left = 1, 
+                           margin_right = 1) {
+  
+  # Convert input_data_matrix_1 to consistent numeric matrix format
+  if (is.data.frame(SOM_output$input_data_matrix_1)) {
+    SOM_output$input_data_matrix_1 <- as.matrix(
+      sapply(SOM_output$input_data_matrix_1, as.numeric)) #convert each column to numeric
+  } else if (is.list(SOM_output$input_data_matrix_1)) {SOM_output$input_data_matrix_1 <- do.call(cbind, SOM_output$input_data_matrix_1) #combine list elements into matrix
+  } else if (is.matrix(SOM_output$input_data_matrix_1) || inherits(SOM_output$input_data_matrix_1, "array")) {
+    SOM_output$input_data_matrix_1 <- as.matrix(SOM_output$input_data_matrix_1) #ensure it is a matrix
+  } else {stop("Unsupported data format for input_data_matrix_1. Must be a data frame, list or matrix")}
+  
+  # Check for NA, NaN, or Inf values
+  if (any(is.na(SOM_output$input_data_matrix_1))) {warning("NA values detected. Replacing with column means.")
+    if (any(is.na(SOM_output$input_data_matrix_1))) { #replace NA values in matrix with column means
+      col_means <- apply(SOM_output$input_data_matrix_1, 2, mean, na.rm = T) #calculate column means
+      for (j in seq_len(ncol(SOM_output$input_data_matrix_1))) {SOM_output$input_data_matrix_1[is.na(SOM_output$input_data_matrix_1[, j]), j] <- col_means[j]}}} #loop through each column
+  if (any(is.infinite(SOM_output$input_data_matrix_1))) {stop("input_data_matrix_1 contains Inf/-Inf values. Replace or remove them.")}
+  
+  # Ensure input is numeric
+  if (!is.numeric(as.matrix(SOM_output$input_data_matrix_1))) {stop("input_data_matrix_1 must be numeric. Check the data and convert if necessary.")}
+  
+  # Remove zero variance columns
+  zero_var_cols <- apply(SOM_output$input_data_matrix_1, 2, var) == 0
+  if (any(zero_var_cols)) {
+    warning("Removing columns with zero variance.")
+    SOM_output$input_data_matrix_1 <- SOM_output$input_data_matrix_1[, !zero_var_cols]}
+  
+  # Ensure cluster numbers are valid
+  if (SOM_output$N_considered_clusters > nrow(SOM_output$input_data_matrix_1)) {stop("N_considered_clusters exceeds the number of rows in input_data_matrix_1.")}
+  
+  # Generate Cluster Labels
+  cluster_labels <- rbind.data.frame(lapply(1:SOM_output$N_considered_clusters, function(x) { #preprocess input data and generate cluster labels using k-means
+    kmeans(SOM_output$input_data_matrix_1, x)$cluster})) #run k-means for each K and store cluster labels
+  rownames(cluster_labels) <- rownames(SOM_output$input_data_matrix_1)
+  colnames(cluster_labels) <- paste("K", 1:SOM_output$N_considered_clusters, sep = '')
+  
+  # Plot SOM Neighbour Distances
+  par(mfrow = c(2, 1), mar = c(margin_bottom, margin_left, margin_top, margin_right))
+  plot(SOM_output$som_model, type = "dist.neighbours", main = "", palette.name = color_palette_SOM_neighbour_distances)
+  title("SOM neighbour distances", line = 0)
+  
+  # Relabel SOM Clusters and Plot
+  run.k <- max(SOM_output$som_cluster) #get inferred cluster number from SOM output
+  message("Inferred number of clusters (K): ", run.k)
+  run.labels <- as.numeric(cluster_labels[, run.k]) #pull DAPC labels matching current K
+  refactor <- data.frame(row.names = rownames(cluster_labels))
+  
+  # Generate all label permutations for the current K and apply them
+  label.perm <- permn(1:run.k)
+  for (j in 1:length(label.perm)) {refactor[, j] <- SOM_output$cluster_assignment}
+  for (k in 1:length(label.perm)) {refactor[, k] <- as.numeric(permuteLevels(factor(refactor[, k]), perm = label.perm[[k]]))}
+  run.labels <- refactor[, which.min(apply(refactor, 2, function(x) {sum(abs(x - run.labels))}))] #select relabeling that minimizes distance to original labels by calculating sum of absolute differences
+  
+  ## Generate Colors
+  k.cols <- color_palette_SOM_cluster(run.k) #use inferred number of clusters (run.k) for length of k.cols palette
+  som.cols <- run.labels #assign colors to SOM clusters using relabeled cluster assignments
+  som.cols <- setNames(som.cols, SOM_output$cluster_assignment) #assign color labels to SOM clusters
+  som.cols <- unique(som.cols[sort(names(som.cols))]) #set to refactored labels
+  
+  # Plot SOM clusters
+  plot(SOM_output$som_model, shape = "straight", type = "mapping", bgcol = k.cols[som.cols][SOM_output$som_cluster], main = "", pch = sample_shape, col = sample_color)
+  if (run.k > 1) {add.cluster.boundaries(SOM_output$som_model, SOM_output$som_cluster, col = boundary_color)} #add boundaries around SOM clusters for k > 1
+  title("SOM clusters", line = 0)}
+
+
+## Function to plot variable importance for each SOM matrix (based on Codebook Vectors/Neuron Weights)
+variable.importance.SOM <- function(SOM_output, 
+                                    color_palette_plot = viridis::turbo,
+                                    bars_threshold_N = 50,
+                                    left_margin_plot = 8.5,
+                                    all_margins_plot = 3,
+                                    title_font_size = 1.2,
+                                    many_label_font_size = 21) {
+  
+  # Extract SOM codes
+  codes <- SOM_output$som_model$codes
+  n_matrices <- length(codes)
+  m.codes <- lapply(codes, function(x) apply(x, 2, median)) #calculate median for each column in each matrix
+  
+  # Extract matrix names from SOM_output
+  if ("input_data_matrix_name" %in% names(SOM_output)) {matrix_names <- list(SOM_output$input_data_matrix_name) #single-layer case
+  } else if ("input_data_matrices_names" %in% names(SOM_output)) {matrix_names <- SOM_output$input_data_matrices_names #multi-layer case
+  } else {stop("Matrix names not found in provided SOM_output.")}
+  
+  # Iterate over each matrix and generate plots
+  for (i in seq_along(m.codes)) {
+    
+    # Extract sorted data and corresponding labels
+    sorted_data <- sort(m.codes[[i]][which(m.codes[[i]] > 0.001)])
+    y_labels <- names(sorted_data)
+    num_bars <- length(sorted_data) #number of bars
+    
+    # Dynamically adjust label size or suppress labels
+    if (num_bars > bars_threshold_N) {
+      y_labels <- rep("", num_bars) #suppress y-axis labels
+      label_size <- 1 #default size when labels are suppressed
+      margins <- c(all_margins_plot, all_margins_plot, all_margins_plot, all_margins_plot) #margins for suppressed labels
+      message(paste("Matrix", i, "has too many bars. Y-axis labels are suppressed. Increase bars_threshold_N to show labels"))
+    } else {
+      label_size <- ifelse(num_bars <= 10, 1, many_label_font_size / num_bars)
+      margins <- c(all_margins_plot, left_margin_plot, all_margins_plot, all_margins_plot)} #standard margin for visible labels
+    
+    # Barplot for current matrix
+    layer.cols <- color_palette_plot(n_matrices) #define colors using viridis palette
+    par(mar = margins, mfrow = c(1, 1)) #set margins and plotting parameters
+    barplot(sorted_data, horiz = T, las = 1, col = layer.cols[i], xlim = c(0, 1), names.arg = y_labels, cex.names = label_size)
+    mtext(paste("Variable importance -", matrix_names[[i]]), side = 3, line = 1, cex = title_font_size, font = 2)} #adjust title size
+  
+  return(m.codes)} #return computed median values
+
+
+## Function to plot Structure-like barplots
+plot.structure.SOM <- function(SOM_output, 
+                               linkage_method = "single", 
+                               csv_filename_admixture_proportions,
+                               color_palette = viridis::viridis, 
+                               margin_top = 2,
+                               margin_bottom = 9.5,
+                               margin_left = 4, 
+                               margin_right = 2,
+                               sort_by_col = 1,
+                               save_csv = T, 
+                               overwrite = T) {
+  
+  # Ensure input is valid
+  if (is.null(SOM_output$q_mat) || !is.matrix(SOM_output$q_mat)) {stop("Input 'SOM_output$q_mat' must be a non-null matrix.")}
+  
+  # Order rows of SOM_output$q_mat based on values in the specified column
+  admixture_proportions <- SOM_output$q_mat[order(SOM_output$q_mat[, sort_by_col]), ]
+  
+  # If there's only one cluster, no need for clustering or sorting
+  if (nrow(SOM_output$q_mat) == 1) { 
+    cat("Only one cluster detected, skipping structure plot.\n")
+    SOM_admixture_proportions <- SOM_output$q_mat  # No change needed
+  } else {
+  
+  # Perform hierarchical clustering on distance matrix
+  cluster_order <- hclust(dist(admixture_proportions), method = linkage_method)$order
+  SOM_admixture_proportions <- admixture_proportions[cluster_order, ]
+  
+  # Save to CSV if save_csv is TRUE
+  if (save_csv) {
+    if (file.exists(csv_filename_admixture_proportions)) { #check if file exists
+      if (overwrite) {
+        write.csv(SOM_admixture_proportions, file = csv_filename_admixture_proportions, row.names = T)
+        message(paste("SOM admixture proportions overwritten and saved to", csv_filename_admixture_proportions))
+      } else {message(paste("File", csv_filename_admixture_proportions, "already exists. Set overwrite = TRUE to overwrite file"))}
+    } else {
+      write.csv(SOM_admixture_proportions, file = csv_filename_admixture_proportions, row.names = T)
+      message(paste("SOM admixture proportions saved to", csv_filename_admixture_proportions))}}
+  
+  # Plot Structure-like barplot
+  layer_colors <- color_palette(ncol(SOM_admixture_proportions)) #generate layer colors
+  par(mfrow = c(1, 1))
+  make.structure.plot(admix.proportions = SOM_admixture_proportions, sample.names = rownames(SOM_admixture_proportions), 
+                      mar = c(margin_bottom, margin_left, margin_top, margin_right), 
+                      layer.colors = layer_colors, sort.by = sort_by_col)}}
+```
+
+
+### Run SOMs, and evaluate and plot SOM results
+
+##### Specify parameters for SOM runs
+```{r}
+SOM_steps <- 100 #number of steps
+SOM_replicates <- 100 #number of replicates for SOM method
+SOM_clusters <- 12 #max number of considered clusters
+```
+
+##### Run single-layer and multi-layer SOMs
+```{r}
+SOM_Alleles <- Single.Layer.SOM(input_data_matrix = Alleles, N_replicates = SOM_replicates, 
+                                N_steps = SOM_steps, N_considered_clusters = SOM_clusters, save_SOM_results = "SOM_results_Alleles.RData")
+SOM_ENV <- Single.Layer.SOM(input_data_matrix = ENV, N_replicates = SOM_replicates, 
+                            N_steps = SOM_steps, N_considered_clusters = SOM_clusters, save_SOM_results = "SOM_results_ENV.RData")
+SOM_MORPH <- Single.Layer.SOM(input_data_matrix = MORPH, N_replicates = SOM_replicates, 
+                              N_steps = SOM_steps, N_considered_clusters = SOM_clusters, save_SOM_results = "SOM_results_MORPH.RData")
+SOM_Alleles_ENV_MORPH <- Multi.Layer.SOM(input_data_matrices = list(Alleles, ENV, MORPH), 
+                                         N_replicates = SOM_replicates, N_steps = SOM_steps, 
+                                         N_considered_clusters = SOM_clusters, save_SOM_results = "SOM_results_Alleles_ENV_MORPH.RData")
+```
+
+
+##### Plot learning progress for each SOM matrix
+```{r}
+plot.Learning.SOM(SOM_Alleles)
+plot.Learning.SOM(SOM_ENV)
+plot.Learning.SOM(SOM_MORPH)
+plot.Learning.SOM(SOM_Alleles_ENV_MORPH)
+```
+
+##### Plot layer weights (this will only work for our multi-layer SOM, as you can see from the message)
+```{r}
+plot.Layers.SOM(SOM_Alleles)
+plot.Layers.SOM(SOM_ENV)
+plot.Layers.SOM(SOM_MORPH)
+plot.Layers.SOM(SOM_Alleles_ENV_MORPH)
+```
+
+##### Evaluate K-values
+```{r}
+plot.K.SOM(SOM_Alleles)
+plot.K.SOM(SOM_ENV)
+plot.K.SOM(SOM_MORPH)
+plot.K.SOM(SOM_Alleles_ENV_MORPH)
+```
+
+##### Get and synchronize labels for different K values and summarize across K for Qmat
+```{r}
+SOM_Alleles <- match.k.and.labels.SOM(SOM_Alleles)
+SOM_ENV <- match.k.and.labels.SOM(SOM_ENV)
+SOM_MORPH <- match.k.and.labels.SOM(SOM_MORPH)
+SOM_Alleles_ENV_MORPH <- match.k.and.labels.SOM(SOM_Alleles_ENV_MORPH)
+```
+
+##### Plot model results as SOM grids (showing sample assignment to cells, cell distances and boundaries between cell clusters, with each cell being occupied by zero to n individuals)
+```{r}
+plot.Model.SOM(SOM_Alleles)
+plot.Model.SOM(SOM_ENV)
+plot.Model.SOM(SOM_MORPH)
+plot.Model.SOM(SOM_Alleles_ENV_MORPH)
+```
+
+##### Plot Structure-like barplots and save admixture proportions as csv file
+```{r}
+plot.structure.SOM(SOM_Alleles, csv_filename_admixture_proportions = "SOM_alleles_admixture.csv", margin_bottom = 5)
+plot.structure.SOM(SOM_ENV, csv_filename_admixture_proportions = "SOM_ENV_admixture.csv", margin_bottom = 5)
+plot.structure.SOM(SOM_MORPH, csv_filename_admixture_proportions = "SOM_MORPH_admixture.csv", margin_bottom = 5)
+plot.structure.SOM(SOM_Alleles_ENV_MORPH, csv_filename_admixture_proportions = "SOM_Alleles_ENV_MORPH_admixture.csv", margin_bottom = 5)
+```
+
+##### Plot variable importance for each matrix (based on Codebook Vectors/Neuron Weights)
+```{r, message = F, results = F}
+variable.importance.SOM(SOM_Alleles)
+variable.importance.SOM(SOM_ENV)
+variable.importance.SOM(SOM_MORPH)
+variable.importance.SOM(SOM_Alleles_ENV_MORPH)
+```
