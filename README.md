@@ -1,8 +1,2 @@
-"Population_genetics_tutorial.html"
-
-This tutorial covers the basic population genetics analyses for a set of populations (or closely related species)
-1) Evaluating, filtering and plotting the genetic data
-2) Test for Hardy-Weinberg-Equilibrium (HWE) and linkage between loci
-3) Calculating, assessing and plotting genotypic richness and diversity, heterozygosity, F-statistics, and isolation-by-distance (IBD)
-4) Performing and plotting principal component analyses (PCA) and discriminant analyses of principal components (DAPC)
-5) Creating maps based on the DAPC results
+1) "Population_genetics_tutorial.html": this tutorial covers the basic population genetics analyses for a set of populations (or closely related species)
+2) "SOM-based clustering.html" This tutorial covers using single-layer (one data matrix) or multi-layer (multiple data matrices) Kohonen Self-Organizing Maps (SOMs or SuperSOMs) to infer clusters and delimit species using unsupervised machine learning
