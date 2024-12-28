@@ -1,3 +1,5 @@
+"Population_genetics_tutorial.html"
+
 This tutorial covers the basic population genetics analyses for a set of populations (or closely related species)
 1) Evaluating, filtering and plotting the genetic data
 2) Test for Hardy-Weinberg-Equilibrium (HWE) and linkage between loci
